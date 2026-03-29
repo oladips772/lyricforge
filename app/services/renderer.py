@@ -1,255 +1,221 @@
 """
-FFmpeg rendering engine.
-Trims each clip to phrase duration, burns lyric text, concatenates, mixes audio.
+FFmpeg rendering engine — fixed version.
+- Covers full audio duration (no more 47s cutoffs)
+- Proper glow using thick border + large shadows
+- Clips loop if too short, rotated across all downloaded footage
+- Footage switches every 6s for variety
 """
 
 import os
+import random
 import subprocess
 import json
-import math
-from pathlib import Path
 
-# Text style presets
 TEXT_STYLES = {
     "bold": {
         "fontsize": 72,
         "fontcolor": "white",
         "box": 1,
-        "boxcolor": "black@0.45",
-        "boxborderw": 16,
+        "boxcolor": "black@0.5",
+        "boxborderw": 18,
         "font": "DejaVu-Sans-Bold",
-        "shadowcolor": "black@0.8",
+        "shadowcolor": "black",
         "shadowx": 3,
         "shadowy": 3,
     },
     "minimal": {
-        "fontsize": 60,
+        "fontsize": 64,
         "fontcolor": "white",
         "box": 0,
         "font": "DejaVu-Sans",
-        "shadowcolor": "black@0.9",
-        "shadowx": 2,
-        "shadowy": 2,
+        "shadowcolor": "black",
+        "shadowx": 3,
+        "shadowy": 3,
     },
     "glow": {
-        "fontsize": 68,
-        "fontcolor": "#FFD700",
+        "fontsize": 72,
+        "fontcolor": "FFD700",
         "box": 0,
         "font": "DejaVu-Sans-Bold",
-        "shadowcolor": "#FF8C00@0.8",
-        "shadowx": 0,
-        "shadowy": 0,
-        "borderw": 3,
-        "bordercolor": "#FF8C00",
+        "borderw": 4,
+        "bordercolor": "FF8C00",
+        "shadowcolor": "FF4500",
+        "shadowx": 8,
+        "shadowy": 8,
     },
 }
 
 RESOLUTION_MAP = {
-    "1080x1920": (1080, 1920),  # vertical / Shorts
-    "1920x1080": (1920, 1080),  # horizontal / YouTube
-    "1080x1080": (1080, 1080),  # square / Instagram
+    "1080x1920": (1080, 1920),
+    "1920x1080": (1920, 1080),
+    "1080x1080": (1080, 1080),
 }
+
+CLIP_SWITCH_INTERVAL = 6.0
 
 
 def get_video_duration(path: str) -> float:
-    """Get video duration in seconds using ffprobe."""
     result = subprocess.run([
         "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", path
+        "-show_format", path
     ], capture_output=True, text=True)
-    data = json.loads(result.stdout)
-    for s in data.get("streams", []):
-        if s.get("codec_type") == "video":
-            return float(s.get("duration", 10.0))
-    return 10.0
+    try:
+        data = json.loads(result.stdout)
+        return float(data.get("format", {}).get("duration", 10.0))
+    except Exception:
+        return 10.0
 
 
 def get_audio_duration(path: str) -> float:
     result = subprocess.run([
         "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", "-select_streams", "a", path
+        "-show_format", path
     ], capture_output=True, text=True)
-    data = json.loads(result.stdout)
-    for s in data.get("streams", []):
-        return float(s.get("duration", 0))
-    return 0.0
+    try:
+        data = json.loads(result.stdout)
+        return float(data.get("format", {}).get("duration", 0))
+    except Exception:
+        return 0.0
 
 
-def build_drawtext(text: str, style_name: str, w: int, h: int) -> str:
-    """Build FFmpeg drawtext filter string."""
+def build_drawtext(text: str, style_name: str) -> str:
     s = TEXT_STYLES.get(style_name, TEXT_STYLES["bold"])
-
-    # Escape special chars for FFmpeg
-    text = text.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
-
+    text = (text
+        .replace("\\", "\\\\")
+        .replace("'", "\u2019")
+        .replace(":", "\\:")
+        .replace("%", "\\%")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace(",", "\\,")
+    )
     parts = [
         f"text='{text}'",
         f"fontsize={s['fontsize']}",
         f"fontcolor={s['fontcolor']}",
         f"font={s['font']}",
-        f"x=(w-text_w)/2",
-        f"y=(h*0.72)",  # lower third area
-        f"shadowcolor={s.get('shadowcolor', 'black@0.8')}",
-        f"shadowx={s.get('shadowx', 2)}",
-        f"shadowy={s.get('shadowy', 2)}",
+        "x=(w-text_w)/2",
+        "y=(h*0.75-text_h/2)",
+        f"shadowcolor={s['shadowcolor']}",
+        f"shadowx={s['shadowx']}",
+        f"shadowy={s['shadowy']}",
     ]
-
     if s.get("box"):
-        parts += [
-            f"box={s['box']}",
-            f"boxcolor={s['boxcolor']}",
-            f"boxborderw={s['boxborderw']}",
-        ]
-
+        parts += [f"box=1", f"boxcolor={s['boxcolor']}", f"boxborderw={s['boxborderw']}"]
     if s.get("borderw"):
-        parts += [
-            f"borderw={s['borderw']}",
-            f"bordercolor={s['bordercolor']}",
-        ]
-
+        parts += [f"borderw={s['borderw']}", f"bordercolor={s['bordercolor']}"]
     return "drawtext=" + ":".join(parts)
 
 
-def trim_and_prep_clip(clip_path: str, duration: float, out_path: str, w: int, h: int) -> bool:
-    """
-    Trims clip to `duration` seconds and scales/crops to target resolution.
-    Returns True on success.
-    """
-    vid_duration = get_video_duration(clip_path)
-    # Start at random offset if clip is longer than needed
-    max_start = max(0, vid_duration - duration - 0.5)
-    import random
-    start = round(random.uniform(0, max_start), 2) if max_start > 0 else 0
-
+def loop_clip_to_duration(clip_path: str, duration: float, out_path: str, w: int, h: int) -> bool:
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start),
+        "-stream_loop", "-1",
         "-i", clip_path,
         "-t", str(duration),
-        "-vf", (
-            f"scale={w}:{h}:force_original_aspect_ratio=increase,"
-            f"crop={w}:{h},"
-            f"setsar=1"
-        ),
-        "-r", "30",
-        "-an",  # strip audio from clip
+        "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps=30",
+        "-an",
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "23",
         out_path
     ]
-
     result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[loop_clip] failed: {result.stderr[-300:]}")
     return result.returncode == 0
 
 
-def render_lyric_video(
-    phrases: list[dict],
-    audio_path: str,
-    output_path: str,
-    text_style: str = "bold",
-    resolution: str = "1080x1920",
-    temp_dir: str = "temp",
-) -> bool:
-    """
-    Full render pipeline:
-    1. Trim each clip to phrase duration
-    2. Burn lyrics with drawtext
-    3. Concatenate all segments
-    4. Mix with original audio
-    """
+def build_footage_timeline(phrases, available_clips, audio_dur, temp_dir, w, h):
+    segments = []
+    t = 0.0
+    clip_idx = 0
+    while t < audio_dur:
+        seg_end = min(t + CLIP_SWITCH_INTERVAL, audio_dur)
+        duration = round(seg_end - t, 3)
+        clip_path = available_clips[clip_idx % len(available_clips)]
+        clip_idx += 1
+        mid = t + duration / 2
+        active_text = ""
+        for phrase in phrases:
+            if phrase["start"] <= mid <= phrase["end"]:
+                active_text = phrase["text"]
+                break
+        prepped = os.path.join(temp_dir, f"seg_{len(segments):04d}.mp4")
+        ok = loop_clip_to_duration(clip_path, duration, prepped, w, h)
+        if ok:
+            segments.append({"start": t, "end": seg_end, "text": active_text, "prepped_path": prepped})
+        else:
+            print(f"[timeline] segment t={t:.1f}s failed")
+        t = seg_end
+    return segments
+
+
+def render_lyric_video(phrases, audio_path, output_path, text_style="bold", resolution="1080x1920", temp_dir="temp"):
     w, h = RESOLUTION_MAP.get(resolution, (1080, 1920))
     audio_dur = get_audio_duration(audio_path)
+    print(f"[render] Audio: {audio_dur:.1f}s | {w}x{h}")
 
-    # Fill in None clip_paths with neighbor
-    last_good = None
-    for p in phrases:
-        if p.get("clip_path") and os.path.exists(p["clip_path"]):
-            last_good = p["clip_path"]
-        elif last_good:
-            p["clip_path"] = last_good
+    available_clips = list({
+        p["clip_path"] for p in phrases
+        if p.get("clip_path") and os.path.exists(p["clip_path"])
+    })
+    if not available_clips:
+        raise RuntimeError("No valid clips — check API keys")
 
-    # Filter out phrases still missing clips
-    valid_phrases = [p for p in phrases if p.get("clip_path") and os.path.exists(p["clip_path"])]
+    random.shuffle(available_clips)
+    print(f"[render] {len(available_clips)} clips available")
 
-    if not valid_phrases:
-        raise RuntimeError("No valid clips found — check API keys and network")
+    segments = build_footage_timeline(phrases, available_clips, audio_dur, temp_dir, w, h)
+    if not segments:
+        raise RuntimeError("No segments built")
+    print(f"[render] {len(segments)} segments covering {audio_dur:.1f}s")
 
-    # Extend last phrase to cover full audio duration
-    valid_phrases[-1]["end"] = max(valid_phrases[-1]["end"], audio_dur)
-
-    segment_paths = []
+    burned_paths = []
     segment_list_file = os.path.join(temp_dir, "segments.txt")
 
-    for i, phrase in enumerate(valid_phrases):
-        duration = max(0.5, phrase["end"] - phrase["start"])
-        prepped = os.path.join(temp_dir, f"prepped_{i:04d}.mp4")
+    for i, seg in enumerate(segments):
         burned = os.path.join(temp_dir, f"burned_{i:04d}.mp4")
+        if seg["text"]:
+            drawtext = build_drawtext(seg["text"], text_style)
+            cmd = [
+                "ffmpeg", "-y", "-i", seg["prepped_path"],
+                "-vf", drawtext,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-an", burned
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[render] drawtext failed seg {i}: {result.stderr[-200:]}")
+                burned = seg["prepped_path"]
+        else:
+            burned = seg["prepped_path"]
+        burned_paths.append(burned)
 
-        # Step 1: trim + scale
-        ok = trim_and_prep_clip(phrase["clip_path"], duration, prepped, w, h)
-        if not ok:
-            print(f"[render] trim failed for phrase {i}, skipping")
-            continue
-
-        # Step 2: burn lyrics
-        drawtext = build_drawtext(phrase["text"], text_style, w, h)
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", prepped,
-            "-vf", drawtext,
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "22",
-            "-an",
-            burned
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[render] drawtext failed for phrase {i}: {result.stderr[-300:]}")
-            continue
-
-        segment_paths.append(burned)
-
-    if not segment_paths:
-        raise RuntimeError("All segment renders failed")
-
-    # Step 3: write concat list
     with open(segment_list_file, "w") as f:
-        for sp in segment_paths:
-            f.write(f"file '{os.path.abspath(sp)}'\n")
+        for bp in burned_paths:
+            f.write(f"file '{os.path.abspath(bp)}'\n")
 
-    # Step 4: concat + add audio
     concat_video = os.path.join(temp_dir, "concat.mp4")
-    cmd_concat = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
+    result = subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", segment_list_file,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "22",
-        concat_video
-    ]
-    result = subprocess.run(cmd_concat, capture_output=True, text=True)
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22", concat_video
+    ], capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"Concat failed: {result.stderr[-500:]}")
+        raise RuntimeError(f"Concat failed: {result.stderr[-400:]}")
 
-    # Step 5: mix audio (trim video to audio length)
-    cmd_mix = [
+    result = subprocess.run([
         "ffmpeg", "-y",
         "-i", concat_video,
         "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
+        "-map", "0:v:0", "-map", "1:a:0",
         "-t", str(audio_dur),
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-shortest",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         output_path
-    ]
-    result = subprocess.run(cmd_mix, capture_output=True, text=True)
+    ], capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"Audio mix failed: {result.stderr[-500:]}")
+        raise RuntimeError(f"Audio mix failed: {result.stderr[-400:]}")
 
+    final_dur = get_video_duration(output_path)
+    print(f"[render] Final video: {final_dur:.1f}s ✓")
     return True
